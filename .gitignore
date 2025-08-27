@@ -1,0 +1,9 @@
+# macOS / tooling
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# build/test artifacts
+/tmp/
+*.log
