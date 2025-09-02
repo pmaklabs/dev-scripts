@@ -13,6 +13,7 @@ Outputs:
   1) Keystore aliases -> serial + sha256
   2) Metadata certs FOUND in keystore (PEM + serial + sha256 + alias)
   3) Metadata certs NOT FOUND in keystore (PEM + serial + sha256)
+  4) Final summary: NOT FOUND (serial, sha256) one-per-line
 EOF
 }
 
@@ -42,7 +43,8 @@ trap 'rm -rf "$WORKDIR"' EXIT
 #   JKS_INDEX : SERIAL|SHA256|ALIAS|PEMFILE
 JKS_INDEX="$WORKDIR/jks_index.txt"
 META_INDEX="$WORKDIR/meta_index.txt"
-: >"$JKS_INDEX"; : >"$META_INDEX"
+MISSING_SUMMARY="$WORKDIR/missing_serial_sha256.txt"   # serial sha256
+: >"$JKS_INDEX"; : >"$META_INDEX"; : >"$MISSING_SUMMARY"
 
 normalize_serial() {
   # stdin: "serial=00a1..." or "00A1..."
@@ -153,6 +155,8 @@ while IFS='|' read -r mserial mfp mpem; do
     printf '## serial: %s (NOT IN KEYSTORE)\n## sha256: %s\n' "$mserial" "$mfp"
     cat "$mpem"
     echo
+    # record for final summary
+    printf '%s %s\n' "$mserial" "$mfp" >> "$MISSING_SUMMARY"
   fi
 done < "$META_INDEX"
 (( MISSING == 0 )) && echo "(none)"
@@ -161,6 +165,14 @@ echo
 echo "=== Keystore summary (alias -> serial, sha256) ==="
 if [[ -s "$JKS_INDEX" ]]; then
   awk -F'|' '{printf "- %s  (serial %s, sha256 %s)\n", $3, $1, $2}' "$JKS_INDEX" | sort
+else
+  echo "(none)"
+fi
+
+echo
+echo "=== Final summary: NOT FOUND (serial, sha256) ==="
+if [[ -s "$MISSING_SUMMARY" ]]; then
+  awk '{printf "- serial %s, sha256 %s\n", $1, $2}' "$MISSING_SUMMARY"
 else
   echo "(none)"
 fi
