@@ -10,9 +10,9 @@ Usage: compare-saml-meta-to-jks.sh <SAML_METADATA_URL> <KEYSTORE.jks|.p12>
 Requires: curl, openssl, keytool (from a JRE/JDK). perl is optional.
 - Password comes from env SAML_JKS_PASSWORD or will be prompted.
 Outputs:
-  1) Keystore aliases -> serial
-  2) Metadata certs FOUND in keystore (PEM + serial + alias)
-  3) Metadata certs NOT FOUND in keystore (PEM + serial)
+  1) Keystore aliases -> serial + sha256
+  2) Metadata certs FOUND in keystore (PEM + serial + sha256 + alias)
+  3) Metadata certs NOT FOUND in keystore (PEM + serial + sha256)
 EOF
 }
 
@@ -33,19 +33,26 @@ if [[ -z "${STOREPASS}" ]]; then
   read -s -p "Keystore password: " STOREPASS; echo
 fi
 
-# Portable mktemp (works on macOS/Linux)
+# Portable mktemp (macOS/Linux)
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/samlmeta.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
 
-JKS_INDEX="$WORKDIR/jks_index.txt"     # SERIAL|ALIAS|PEMFILE
-META_INDEX="$WORKDIR/meta_index.txt"   # SERIAL|PEMFILE
+# Index formats:
+#   META_INDEX: SERIAL|SHA256|PEMFILE
+#   JKS_INDEX : SERIAL|SHA256|ALIAS|PEMFILE
+JKS_INDEX="$WORKDIR/jks_index.txt"
+META_INDEX="$WORKDIR/meta_index.txt"
 : >"$JKS_INDEX"; : >"$META_INDEX"
 
 normalize_serial() {
   # stdin: "serial=00a1..." or "00A1..."
-  # stdout: uppercase hex, no leading zeros (leave single 0 if all zeros)
-  awk '{ s=$0; sub(/^serial=/,"",s); toupper(s);
-         gsub(/^[0]+/,"",s); if (s=="") s="0"; print toupper(s) }'
+  # stdout: UPPERCASE hex, no leading zeros (keep single 0 if all zeros)
+  awk '{ s=$0; sub(/^serial=/,"",s); gsub(/^[0]+/,"",s); if (s=="") s="0"; print toupper(s) }'
+}
+sha256fp() {
+  # stdout: UPPERCASE hex without colons
+  openssl x509 -noout -fingerprint -sha256 -in "$1" \
+    | awk -F= '{print toupper($2)}' | tr -d ':'
 }
 
 echo "==[1/5] Downloading metadata..."
@@ -69,7 +76,7 @@ else
   | awk '!seen[$0]++' > "$EXTRACTED"
 fi
 
-# Write unique PEMs + serials
+# Write unique PEMs + (serial, sha256) for metadata
 i=0
 while IFS= read -r b64; do
   [[ -z "$b64" ]] && continue
@@ -81,9 +88,10 @@ while IFS= read -r b64; do
     printf '%s\n' '-----END CERTIFICATE-----'
   } > "$pem"
   serial="$(openssl x509 -in "$pem" -noout -serial | normalize_serial)"
-  # de-dup by serial too
-  if ! grep -q "^${serial}|" "$META_INDEX"; then
-    printf '%s|%s\n' "$serial" "$pem" >> "$META_INDEX"
+  fp="$(sha256fp "$pem")"
+  # De-dup by fingerprint (exact identity)
+  if ! grep -q "^[^|]*|${fp}|" "$META_INDEX"; then
+    printf '%s|%s|%s\n' "$serial" "$fp" "$pem" >> "$META_INDEX"
   else
     rm -f "$pem"
   fi
@@ -96,12 +104,11 @@ STORETYPE_FLAG=""
 # Try default first; if it fails, fall back to PKCS12 (newer Java defaults)
 if ! keytool -list -keystore "$KS_PATH" -storepass "$STOREPASS" >/dev/null 2>&1; then
   STORETYPE_FLAG="-storetype PKCS12"
-  # Try again with PKCS12; if still bad, bail with keytool error
   keytool -list $STORETYPE_FLAG -keystore "$KS_PATH" -storepass "$STOREPASS" >/dev/null
 fi
 
-echo "==[4/5] Reading keystore (aliases, serials, PEM)..."
-# Grab aliases; keytool -list lines look like: "<alias>, <date>, <type>,"
+echo "==[4/5] Reading keystore (aliases, serials, sha256, PEM)..."
+# keytool -list lines look like: "<alias>, <date>, <type>,"
 keytool -list $STORETYPE_FLAG -keystore "$KS_PATH" -storepass "$STOREPASS" 2>/dev/null \
 | awk -F, '/^[^,]+, /{print $1}' \
 | while IFS= read -r alias; do
@@ -110,7 +117,8 @@ keytool -list $STORETYPE_FLAG -keystore "$KS_PATH" -storepass "$STOREPASS" 2>/de
     pem="$WORKDIR/jks_${safe_alias}.pem"
     if keytool -exportcert -rfc $STORETYPE_FLAG -keystore "$KS_PATH" -storepass "$STOREPASS" -alias "$alias" > "$pem" 2>/dev/null; then
       serial="$(openssl x509 -in "$pem" -noout -serial | normalize_serial)"
-      printf '%s|%s|%s\n' "$serial" "$alias" "$pem" >> "$JKS_INDEX"
+      fp="$(sha256fp "$pem")"
+      printf '%s|%s|%s|%s\n' "$serial" "$fp" "$alias" "$pem" >> "$JKS_INDEX"
     fi
   done
 JKS_COUNT=$(wc -l < "$JKS_INDEX" | tr -d ' ')
@@ -119,14 +127,17 @@ echo "   -> Keystore contains $JKS_COUNT certificate(s)."
 echo "==[5/5] Comparing..."
 
 echo
-echo "=== Certificates PRESENT in keystore (by serial) ==="
+echo "=== Certificates PRESENT in keystore (match by SHA256 or SERIAL) ==="
 FOUND=0
-while IFS='|' read -r mserial mpem; do
-  if grep -q "^${mserial}|" "$JKS_INDEX"; then
+# META_INDEX lines: SERIAL|SHA256|PEM
+while IFS='|' read -r mserial mfp mpem; do
+  if grep -q "^[^|]*|${mfp}|" "$JKS_INDEX" || grep -q "^${mserial}|" "$JKS_INDEX"; then
     FOUND=$((FOUND+1))
-    jline="$(grep "^${mserial}|" "$JKS_INDEX" | head -n1)"
-    jalias="$(printf '%s' "$jline" | cut -d'|' -f2)"
-    printf '## alias: %s\n## serial: %s\n' "$jalias" "$mserial"
+    # Prefer match by fingerprint
+    jline="$(grep "^[^|]*|${mfp}|" "$JKS_INDEX" || true)"
+    [[ -z "$jline" ]] && jline="$(grep "^${mserial}|" "$JKS_INDEX" | head -n1)"
+    jalias="$(printf '%s' "$jline" | cut -d'|' -f3)"
+    printf '## alias: %s\n## serial: %s\n## sha256: %s\n' "$jalias" "$mserial" "$mfp"
     cat "$mpem"
     echo
   fi
@@ -134,12 +145,12 @@ done < "$META_INDEX"
 (( FOUND == 0 )) && echo "(none)"
 
 echo
-echo "=== Certificates NOT FOUND in keystore (by serial) ==="
+echo "=== Certificates NOT FOUND in keystore (by SHA256+SERIAL) ==="
 MISSING=0
-while IFS='|' read -r mserial mpem; do
-  if ! grep -q "^${mserial}|" "$JKS_INDEX"; then
+while IFS='|' read -r mserial mfp mpem; do
+  if ! grep -q "^[^|]*|${mfp}|" "$JKS_INDEX" && ! grep -q "^${mserial}|" "$JKS_INDEX"; then
     MISSING=$((MISSING+1))
-    printf '## serial: %s (NOT IN KEYSTORE)\n' "$mserial"
+    printf '## serial: %s (NOT IN KEYSTORE)\n## sha256: %s\n' "$mserial" "$mfp"
     cat "$mpem"
     echo
   fi
@@ -147,9 +158,9 @@ done < "$META_INDEX"
 (( MISSING == 0 )) && echo "(none)"
 
 echo
-echo "=== Keystore summary (alias -> serial) ==="
+echo "=== Keystore summary (alias -> serial, sha256) ==="
 if [[ -s "$JKS_INDEX" ]]; then
-  awk -F'|' '{printf "- %s  (serial %s)\n", $2, $1}' "$JKS_INDEX" | sort
+  awk -F'|' '{printf "- %s  (serial %s, sha256 %s)\n", $3, $1, $2}' "$JKS_INDEX" | sort
 else
   echo "(none)"
 fi
